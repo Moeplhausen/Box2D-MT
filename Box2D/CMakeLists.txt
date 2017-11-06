@@ -16,6 +16,7 @@ option(BOX2D_BUILD_EXAMPLES "Build Box2D examples" ON)
 
 set(BOX2D_VERSION 2.3.2)
 set(LIB_INSTALL_DIR lib${LIB_SUFFIX})
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Ofast")
 
 # The Box2D library.
 add_subdirectory(Box2D)
