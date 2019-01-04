@@ -9,9 +9,6 @@ workspace "Box2D"
 	configuration "vs*"
 		defines { "_CRT_SECURE_NO_WARNINGS" }
 
-	configuration "gmake*"
-		links { "pthread" }	
-
 	filter "configurations:Debug"
 		targetdir ( "Build/%{_ACTION}/bin/Debug" )
 	 	defines { "DEBUG" }
