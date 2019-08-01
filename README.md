@@ -1,60 +1,194 @@
 
 # Box2D-MT
-**Box2D-MT is an experimental library that adds multi-threading to Box2D.**
 
-It has no external dependencies and aims to be no less deterministic than Box2D.
+**Box2D with multithreading.**
 
-Before using Box2D-MT you should be familiar with Box2D and multi-threading.
+This project improves performance of [Box2D](https://github.com/erincatto/Box2D) by executing the world's step
+function on multiple threads.
 
-# Quick Start
-To enable multi-threading, create a thread-pool and pass it to your world's constructor.
+## Usage
+
+Familiarity with Box2D is assumed. These are the main differences.
+
+### Task Executor
+
+A task executor runs the tasks submitted to it by the world.
 
 ```
-b2ThreadPool tp;
-b2World world(gravity, &tp);
+// Create a task executor
+b2ThreadPoolTaskExecutor executor;
+
+// Pass the executor to the world's step function
+world.Step(timeStep, velocityIterations, positionIterations, executor);
 ```
 
-Now when you step the world, the work will be split among all of your cpu's cores.
-The thread pool must remain in scope until the world is destroyed.
+Box2D-MT comes with a thread pool task executor, but you could use your game
+engine's thread pool instead by implementing b2TaskExecutor.
 
-If you were doing anything interesting in your callbacks, things probably got a little crashy. This is discussed below.
+Spawning worker threads is relatively expensive so you should reuse the same
+executor across steps.
 
-# Callback Thread-Safety
-Box2D uses various callback functions to let the user respond to events. In Box2D-MT, some of these functions
-are called from multiple threads at the same time, so your callback implementations must practice thread-safety.
+### Multithreaded Callbacks
 
-Here are some guidelines for relevant callbacks (these are a work in progress and probably not 100% accurate):
+Box2D-MT adds 4 pure virtual functions to b2ContactListener, which correspond to
+the Box2D functions.
 
-**b2ContactFilter::ShouldCollide**: Treat all bodies and joints as read-only. Don't access any contacts.
+```
+/// This lets you process and filter BeginContact callbacks as they arise from multiple threads.
+virtual bool BeginContactImmediate(b2Contact* contact, uint32 threadId) = 0;
 
-**b2ContactListener::BeginContact, b2ContactListener::EndContact, b2ContactListener::Presolve**:
-Treat all bodies and joints as read-only. The provided contact is safe for reads and writes. Don't access any
-other contacts.
+/// This lets you process and filter EndContact callbacks as they arise from multiple threads.
+virtual bool EndContactImmediate(b2Contact* contact, uint32 threadId) = 0;
 
-**b2ContactListener::PostSolve**: The provided contact is safe for reads and writes. A dynamic body that is part of
-the provided contact is safe for reads and writes, except for the body's flags, which are read-only. Joints
-attached to the dynamic body are safe for reads and writes. A static body that is part of the provided contact
-is read-only, except for it's flags, which must not be accessed at all. Don't access any other bodies, joints,
-or contacts.
+/// This lets you process and filter PreSolve callbacks as they arise from multiple threads.
+virtual bool PreSolveImmediate(b2Contact* contact, const b2Manifold* oldManifold, uint32 threadId) = 0;
 
-A simple way of avoiding these dangers is to queue up events and process them on a single thread when the world
-is done stepping. There's no need for thread-safe data-structures or mutexes (aqcuiring a mutex in a callback can
-kill performance <sup>[*citation needed*]</sup>). You can use an array of per thread data of size b2_maxThreads, and use b2GetThreadId() to index
-the array.
+/// This lets you process and filter PostSolve callbacks as they arise from multiple threads.
+virtual bool PostSolveImmediate(b2Contact* contact, const b2ContactImpulse* impulse, uint32 threadId) = 0;
+```
 
-A later version of Box2D-MT should provide an option to automatically defer callbacks.
+(See b2WorldCallbacks.h for more detailed comments.)
 
+These are called by multiple threads simultaneously, so your implementation must
+be thread-safe.
+
+If your function returns true then the arguments will be saved and used to invoke the
+corresponding non-immediate function after the multithreaded work is finished.
+
+Immediate functions can filter events to avoid the overhead of a deferred call.
+This is more important for PreSolve and PostSolve because more contacts receive
+those calls every step.
+
+You should start with an implementation that simply returns true for callbacks that
+you use and false for callbacks you don't use.
+
+For example:
+
+```
+virtual bool BeginContactImmediate(b2Contact* contact, uint32 threadIndex) override
+{
+    // Call BeginContact for every contact.
+    return true;
+}
+virtual bool EndContactImmediate(b2Contact* contact, uint32 threadIndex) override
+{
+    // Call EndContact for every contact.
+    return true;
+}
+virtual bool PreSolveImmediate(b2Contact* contact, const b2Manifold* oldManifold, uint32 threadIndex) override
+{
+    // Never call PreSolve
+    return false;
+}
+virtual bool PostSolveImmediate(b2Contact* contact, const b2ContactImpulse* impulse, uint32 threadIndex) override
+{
+    // Never call PostSolve
+    return false;
+}
+```
+
+If your performance is acceptable then you should do all work in deferred
+callbacks for the sake of simplicity.
+
+Otherwise, if profiling shows significant time spent in deferred callbacks,
+or in Box2D-MT's processing of deferred callback arguments, then it could help
+to move work into immediate callbacks (while being careful about thread safety).
+
+I'm open to suggestions on changes to the contact listener interface, so create
+an issue if you want to discuss it.
+
+## Time of Impact (TOI) Changes
+
+Since much of TOI is still processed on a single thread, it's important that it doesn't
+do more work than necessary.
+
+SolveTOI was accounting for 66% of the step time on the multithread demo, but
+these changes brought that down to 3% (and additional changes brought that to 1%).
+
+### Finer-grained Continuous Collision Detection (CCD) Control
+
+In Box2D, enabling CCD means you get TOI events for all contacts between dynamic
+and non-dynamic bodies, which can be expensive.
+
+If your static body only has a few thin shapes that are subject to tunneling, and
+many thick shapes that are not, then most of that expense is unnecessary.
+
+Box2D-MT lets you avoid that expense by marking specific fixtures as thick shapes,
+which means they only generate TOI events for contacts with bullet bodies.
+
+```
+/// Set whether this fixture is treated like a thick shape for continuous collision detection.
+/// Note: thick shapes only get TOI events for contacts with bullet bodies.
+void SetThickShape(bool flag);
+
+/// Is this fixture treated like a thick shape for continuous collision detection?
+bool IsThickShape() const;
+```
+
+You can also set thickShape in the fixture def before you create the fixture.
+
+```
+b2FixtureDef fd;
+fd.thickShape = true;
+```
+
+### Partitioning Contacts Based on TOI Eligibility
+
+Box2D's SolveTOI iterates over every contact in the world to find a TOI event,
+possibly visiting many contacts that are not eligible for TOI (because, for example,
+they are between two non-bullet dynamic bodies, or one of the fixtures is a sensor).
+
+Visiting these contacts can take up a significant portion of the step.
+
+Box2D-MT avoids this overhead by evaluating TOI eligibility when the contact is
+created, and partitioning the contact list so that TOI eligible contacts come
+before ineligible contacts. This shifts the cost into functions that are called
+infrequently; b2Fixture::SetSensor, b2Fixture::SetThickShape, and b2Body::SetBullet
+must traverse the body's contacts to reevaluate TOI eligibility.
+
+## Thread Error Detection
+
+I test for data races with valgrind DRD, which generates false positives
+on conflicting atomic loads and stores because it can't detect atomics.
+
+Box2D-MT can be configured to make DRD ignore specific atomic variables, which
+eliminates the false positives. This can help when testing the thread-safety of
+your program with DRD while using b2ThreadPoolTaskExecutor.
+
+The DRD configuration also enables symbols, to identify the source of any problems
+in Box2D-MT. See [Building.md](https://github.com/jhoffman0x/Box2D-MT/blob/master/Building.md) for details on using the DRD configurtion.
+
+## Reproducibility
+
+With Box2D, running the same build on the same machine with the same floating
+point environment will produce the same results every time. This is also true
+for Box2D-MT*, but the order of multithreaded callbacks is indeterminate.
+
+If you rely on reproducibility for features like game replays or multiplayer, then
+you must ensure that the effects of your immediate callbacks don't depend on the
+order in which they're called. An easy solution is to do all order-dependent work
+in deferred callbacks.
+
+*It's tested for reproducibility on every test in the testbed, but that's still
+a small subset of use cases. Create an issue if you identify any inconsistencies.
+
+## License
+
+Box2D-MT uses the same permissive license as Box2D.
+
+
+**Note: the following is from Box2D, as is all included documentation.**
 
 
 ![Box2D Logo](http://box2d.org/images/icon.gif)
 
-# Box2D 
+# Box2D
 
 **Box2D is a 2D physics engine for games.**
 
 For help with Box2D, please visit http://www.box2d.org. There is a forum there where you may post your questions.
 
-Please see `Building.txt` to learn how to build Box2D and run the testbed.
+Please see [Building.md](https://github.com/erincatto/Box2D/blob/master/Building.md) to learn how to build Box2D and run the testbed.
 
 ## Demos
 
@@ -107,10 +241,15 @@ Please do not submit pull requests with new features. Instead, please file an is
 - Mouse picking and the bomb!
 - CMake build system files
 
-### Documentation
-- User manual
-- Doxygen document with code comments
-- Active user forum
+## Documentation
+You can find documentation related to the project in the [documentation page](http://box2d.org/documentation/) and in the [documentation folder](https://github.com/erincatto/Box2D/tree/master/Box2D/Documentation) in GitHub
+- [User manual](http://box2d.org/manual.pdf)
+- [Doxygen document](https://github.com/erincatto/Box2D/blob/master/Box2D/Documentation/Doxyfile) with code comments
+- [subreddit](https://www.reddit.com/r/box2d/)
+- [Discord server](https://discord.gg/NKYgCBP)
+- [User forum (legacy)](http://box2d.org/forum/)
+
+You can also visit the project wiki where you will find the [FAQ](https://github.com/erincatto/Box2D/wiki/FAQ)'s page
 
 ## License
 
